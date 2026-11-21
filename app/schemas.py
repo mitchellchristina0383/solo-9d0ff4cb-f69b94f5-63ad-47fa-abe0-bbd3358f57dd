@@ -36,6 +36,13 @@ class CreateJobRequest(BaseModel):
         description="初始训练进程数",
         json_schema_extra={"example": 2},
     )
+    patience: Optional[int] = Field(
+        None,
+        ge=1,
+        description="早停耐心值 N：连续 N 个已判定检查点未刷新最低验证损失即自动回退并停训；"
+                    "不传则不启用早停",
+        json_schema_extra={"example": 2},
+    )
 
     @field_validator("sample_ids")
     @classmethod
@@ -53,7 +60,12 @@ class JobOut(BaseModel):
     num_processes: int
     current_step: int = Field(description="当前检查点对应的步号；0 表示尚无检查点")
     round_seq: int = Field(description="当前确认轮次；每次回退 +1，重启不变")
-    status: str
+    status: str = Field(description="running=训练中；stopped=已早停停训")
+    patience: Optional[int] = Field(description="早停耐心值；null 表示未启用早停")
+    stop_checkpoint_step: Optional[int] = Field(
+        description="早停选中的检查点步号（损失最低、并列取最早）；未停训为 null"
+    )
+    stopped_at: Optional[str] = Field(description="停训时间；未停训为 null")
     created_at: str
     updated_at: str
 
@@ -141,3 +153,89 @@ class StepStatusOut(BaseModel):
     confirmed: int
     missing_sample_ids: List[str]
     complete: bool
+
+
+# ------------------------------------------------------------------ early stop
+class LossReportRequest(BaseModel):
+    step: int = Field(
+        ...,
+        ge=1,
+        description="被验证的检查点步号（检查点须已登记）",
+        json_schema_extra={"example": 2},
+    )
+    checkpoint_round: int = Field(
+        ...,
+        ge=1,
+        description="该检查点登记时的轮次；用于区分回退后同步号重新登记的新检查点，"
+                    "已作废检查点的迟到结果会被拒收",
+        json_schema_extra={"example": 1},
+    )
+    loss: float = Field(
+        ...,
+        description="同一验证集上的损失（须为有限数值）；同一 (step, checkpoint_round) "
+                    "同值重报只算一次，改报不同值会被拒绝",
+        json_schema_extra={"example": 0.42},
+    )
+
+
+class EarlyStopJudgment(BaseModel):
+    patience: int
+    judged_through_step: int = Field(description="已连续判定到的检查点步号；尚无判定为 0")
+    waiting_for_step: Optional[int] = Field(
+        description="第一个缺报损失的检查点步号（判定在此等待）；无缺报为 null"
+    )
+    best_loss: Optional[float] = Field(description="已判定检查点中的最低损失")
+    best_checkpoint_step: Optional[int] = Field(
+        description="最低损失对应的检查点步号（并列取最早），即触发时的回退目标"
+    )
+    no_improve_count: int = Field(description="当前连续未刷新最低损失的次数")
+    triggered: bool = Field(description="本次判定是否触发早停")
+
+
+class EarlyStopTriggerOut(BaseModel):
+    """触发早停时与上报同一事务生效的自动回退 + 停训结果。"""
+    status: str = Field(description="停训后为 stopped")
+    checkpoint_step: int = Field(description="自动回退到的检查点步号（损失最低、并列取最早）")
+    num_processes: int = Field(description="自动回退不改变进程数")
+    round_seq: int = Field(description="回退后的新轮次")
+    next_step: int
+    rolled_back_at: str
+
+
+class LossReportOut(BaseModel):
+    job_id: str
+    step: int
+    checkpoint_round: int
+    loss: float
+    accepted: bool = Field(description="是否属于当前有效检查点（作废检查点的迟到上报会被拒绝）")
+    newly_recorded: bool = Field(description="本次是否新登记；同值重报为 false（只算一次）")
+    reported_at: str
+    job_status: str = Field(description="上报生效后的作业状态")
+    judgment: EarlyStopJudgment = Field(description="本次上报后的早停判定状态")
+    early_stop: Optional[EarlyStopTriggerOut] = Field(
+        None, description="仅当本次上报触发早停时返回：自动回退与停训已一并生效"
+    )
+
+
+class LossRecordOut(BaseModel):
+    job_id: str
+    step: int
+    round_seq: int = Field(description="检查点的登记轮次")
+    loss: float
+    reported_at: str
+
+
+class EarlyStopStatusOut(BaseModel):
+    job_id: str
+    enabled: bool = Field(description="创建作业时是否指定了 patience")
+    status: str
+    patience: Optional[int] = None
+    judged_through_step: Optional[int] = None
+    waiting_for_step: Optional[int] = None
+    best_loss: Optional[float] = None
+    best_checkpoint_step: Optional[int] = None
+    no_improve_count: Optional[int] = None
+    stop_checkpoint_step: Optional[int] = Field(
+        description="早停选中的检查点步号；重启后仍可查"
+    )
+    stopped_at: Optional[str] = None

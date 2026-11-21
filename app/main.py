@@ -1,14 +1,17 @@
 """FastAPI 样本分派服务。
 
 进程视角的典型流程：
-1. ``POST /jobs`` 登记作业（样本全局顺序、每步总批量、进程数）；
+1. ``POST /jobs`` 登记作业（样本全局顺序、每步总批量、进程数，可选早停耐心值）；
 2. 每个进程在每一步调用 ``GET /jobs/{job_id}/prefetch`` 预取自己的分片；
 3. 读完后调用 ``POST /jobs/{job_id}/ack`` 确认，重复上报只记一次；
 4. 训练端落盘检查点后调用 ``POST /jobs/{job_id}/checkpoints``，
    仅当“上次保存后至末步”各步全部收齐确认时才登记；
-5. 需要回退时 ``POST /jobs/{job_id}/rollback``，可换进程数，
+5. 验证端对每个已登记检查点调用 ``POST /jobs/{job_id}/losses`` 上报同一验证集
+   的损失；连续 N 个已判定检查点未刷新最低损失即触发早停：上报、自动回退到
+   损失最低的检查点、停训在同一事务生效；
+6. 需要回退时 ``POST /jobs/{job_id}/rollback``，可换进程数，
    样本与每步顺序不变，开启新一轮确认；
-6. 服务重启后从 SQLite 恢复，仍可从当前检查点续跑。
+7. 服务重启后从 SQLite 恢复，仍可从当前检查点续跑；已停训作业保持停训状态。
 """
 from __future__ import annotations
 
@@ -35,10 +38,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="训练样本分派 / 检查点协调服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "按步为多进程训练分派样本，用 SQLite 持久化确认进度与检查点，"
-        "支持回退到任意已登记检查点并调整进程数。"
+        "支持回退到任意已登记检查点并调整进程数；创建作业时可指定早停耐心值，"
+        "验证端按检查点上报验证损失，连续未刷新最低损失即自动回退到最优检查点并停训。"
     ),
     lifespan=lifespan,
 )
@@ -66,10 +70,10 @@ async def store_error_handler(_request, exc: StoreError):
 
 # --------------------------------------------------------------------- jobs
 @app.post("/jobs", response_model=schemas.JobOut, status_code=201,
-          tags=["作业"], summary="登记训练作业")
+          tags=["作业"], summary="登记训练作业（可指定早停耐心值）")
 def create_job(req: schemas.CreateJobRequest):
     job = get_db().create_job(
-        req.job_id, req.sample_ids, req.batch_size, req.num_processes
+        req.job_id, req.sample_ids, req.batch_size, req.num_processes, req.patience
     )
     return job
 
@@ -192,6 +196,37 @@ def rollback(
          tags=["回退"], summary="查看回退历史")
 def list_rollbacks(job_id: str):
     return get_db().list_rollbacks(job_id)
+
+
+# -------------------------------------------------------------- early stop
+@app.post(
+    "/jobs/{job_id}/losses",
+    response_model=schemas.LossReportOut,
+    tags=["早停"],
+    summary="验证端上报某检查点在同一验证集上的损失（按步号+登记轮次定位）",
+)
+def report_loss(job_id: str, req: schemas.LossReportRequest):
+    return get_db().report_loss(job_id, req.step, req.checkpoint_round, req.loss)
+
+
+@app.get(
+    "/jobs/{job_id}/losses",
+    response_model=List[schemas.LossRecordOut],
+    tags=["早停"],
+    summary="列出已登记的验证损失（回退作废的检查点记录不保留）",
+)
+def list_losses(job_id: str):
+    return get_db().list_losses(job_id)
+
+
+@app.get(
+    "/jobs/{job_id}/early_stop",
+    response_model=schemas.EarlyStopStatusOut,
+    tags=["早停"],
+    summary="查询早停判定状态（最低损失、连续未刷新次数、停训选中的检查点）",
+)
+def early_stop_status(job_id: str):
+    return get_db().early_stop_status(job_id)
 
 
 @app.get("/health", tags=["运维"], summary="健康检查")

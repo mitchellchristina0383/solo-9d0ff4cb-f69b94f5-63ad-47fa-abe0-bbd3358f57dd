@@ -5,11 +5,17 @@
 - 所有写操作在进程内锁内串行执行，SQLite 自身再用
   ``UNIQUE`` 约束兜底，保证“重复确认只算一次”；
 - 确认按“轮次(round_seq)”隔离，回退开启新一轮后，
-  旧轮次的确认与检查点上报一律拒绝。
+  旧轮次的确认与检查点上报一律拒绝；
+- 验证损失按 ``(检查点步号, 检查点登记轮次)`` 登记：同值重报只算一次，
+  改报不同值拒绝；回退作废检查点的同时作废其损失记录，
+  因此已作废检查点的迟到上报（即使同步号后来重新登记）都会被拒收；
+- 早停的触发上报、自动回退与停训在同一事务内提交，
+  任一步失败整体回滚，调用方可原样重报。
 """
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -40,7 +46,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     num_processes INTEGER NOT NULL,
     current_step  INTEGER NOT NULL DEFAULT 0,  -- 当前已登记检查点的末步
     round_seq     INTEGER NOT NULL DEFAULT 1,  -- 当前确认轮次
-    status        TEXT NOT NULL DEFAULT 'running',
+    status        TEXT NOT NULL DEFAULT 'running',  -- running / stopped(早停)
+    patience      INTEGER,                -- 早停耐心值 N；NULL 表示不启用
+    stop_checkpoint_step INTEGER,         -- 早停选中的检查点步号
+    stopped_at    TEXT,                   -- 停训时间
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
@@ -72,9 +81,27 @@ CREATE TABLE IF NOT EXISTS rollback_events (
     old_processes   INTEGER NOT NULL,
     new_processes   INTEGER NOT NULL,
     round_seq       INTEGER NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'manual',  -- manual / early_stop
     created_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS validation_reports (
+    job_id      TEXT NOT NULL,
+    step        INTEGER NOT NULL,         -- 被验证的检查点步号
+    round_seq   INTEGER NOT NULL,         -- 该检查点的登记轮次（区分回退后同步号的新检查点）
+    loss        REAL NOT NULL,            -- 同一验证集上的损失
+    reported_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, step, round_seq)  -- 同一检查点的上报天然去重
+);
 """
+
+# 老库文件（早期版本创建）缺列时的就地迁移；新库由 SCHEMA 一次建全
+_MIGRATIONS = (
+    ("jobs", "patience", "patience INTEGER"),
+    ("jobs", "stop_checkpoint_step", "stop_checkpoint_step INTEGER"),
+    ("jobs", "stopped_at", "stopped_at TEXT"),
+    ("rollback_events", "kind", "kind TEXT NOT NULL DEFAULT 'manual'"),
+)
 
 
 class Database:
@@ -92,6 +119,13 @@ class Database:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            for table, column, ddl in _MIGRATIONS:
+                cols = {
+                    r["name"]
+                    for r in self._conn.execute(f"PRAGMA table_info({table})")
+                }
+                if column not in cols:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
             self._conn.commit()
 
     def close(self) -> None:
@@ -130,6 +164,7 @@ class Database:
         sample_ids: List[str],
         batch_size: int,
         num_processes: int,
+        patience: Optional[int] = None,
     ) -> dict:
         now = utc_now_iso()
         with self._lock:
@@ -140,9 +175,10 @@ class Database:
                 raise ConflictError(f"作业 {job_id} 已存在")
             self._conn.execute(
                 "INSERT INTO jobs (job_id, sample_ids, batch_size, num_processes,"
-                " current_step, round_seq, status, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, 0, 1, 'running', ?, ?)",
-                (job_id, json.dumps(sample_ids), batch_size, num_processes, now, now),
+                " current_step, round_seq, status, patience, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, 0, 1, 'running', ?, ?, ?)",
+                (job_id, json.dumps(sample_ids), batch_size, num_processes,
+                 patience, now, now),
             )
             self._conn.commit()
         return self.get_job(job_id)
@@ -176,9 +212,19 @@ class Database:
         d["total_steps"] = self.total_steps(d["sample_count"], d["batch_size"])
         return d
 
+    @staticmethod
+    def _ensure_running(job: dict, action: str) -> None:
+        """停训（早停生效）后，预取/确认/检查点登记/手动回退一律拒绝。"""
+        if job["status"] != "running":
+            raise ConflictError(
+                f"作业 {job['job_id']} 已停训（status={job['status']}，早停选中检查点 "
+                f"step={job['stop_checkpoint_step']}），拒绝{action}"
+            )
+
     # -------------------------------------------------------------- prefetch
     def prefetch(self, job_id: str, step: int, rank: int) -> dict:
         job = self.get_job(job_id)
+        self._ensure_running(job, "预取样本")
         total_steps = job["total_steps"]
         if step <= job["current_step"]:
             raise ConflictError(
@@ -215,6 +261,7 @@ class Database:
     ) -> dict:
         with self._lock:
             job = self.get_job(job_id)
+            self._ensure_running(job, "样本确认")
             if round_seq != job["round_seq"]:
                 raise ConflictError(
                     f"确认来自旧轮次 round={round_seq}，当前轮次为 {job['round_seq']}；"
@@ -303,6 +350,7 @@ class Database:
     ) -> dict:
         with self._lock:
             job = self.get_job(job_id)
+            self._ensure_running(job, "检查点登记")
             if round_seq != job["round_seq"]:
                 raise ConflictError(
                     f"检查点上报来自旧轮次 round={round_seq}，当前轮次为 {job['round_seq']}"
@@ -352,6 +400,67 @@ class Database:
             }
 
     # -------------------------------------------------------------- rollback
+    def _apply_rollback(
+        self,
+        job: dict,
+        checkpoint_step: int,
+        new_processes: int,
+        kind: str,
+    ) -> dict:
+        """回退的公共落库逻辑（手动回退与早停自动回退共用）。
+
+        调用方须已持有 ``self._lock``，本方法不自行 commit，
+        以便与触发它的其他写入（如早停的损失上报、停训标记）同事务生效。
+        """
+        job_id = job["job_id"]
+        new_round = job["round_seq"] + 1
+        now = utc_now_iso()
+        # 清空当前轮次的所有确认——旧确认随旧轮次一并作废
+        self._conn.execute(
+            "DELETE FROM confirmations WHERE job_id = ? AND round_seq = ?",
+            (job_id, job["round_seq"]),
+        )
+        # 作废晚于回退目标的检查点：它们位于被放弃的进度上，
+        # 保留会污染回退后的可选检查点列表，并与新一轮登记冲突
+        self._conn.execute(
+            "DELETE FROM checkpoints WHERE job_id = ? AND step > ?",
+            (job_id, checkpoint_step),
+        )
+        # 已作废检查点的损失记录一并清除；仍可回退的检查点（step <= 目标）
+        # 的损失保留，继续参与后续早停判定
+        self._conn.execute(
+            "DELETE FROM validation_reports WHERE job_id = ? AND step > ?",
+            (job_id, checkpoint_step),
+        )
+        self._conn.execute(
+            "UPDATE jobs SET current_step = ?, num_processes = ?,"
+            " round_seq = ?, updated_at = ? WHERE job_id = ?",
+            (checkpoint_step, new_processes, new_round, now, job_id),
+        )
+        self._conn.execute(
+            "INSERT INTO rollback_events"
+            " (job_id, from_step, checkpoint_step, old_processes,"
+            "  new_processes, round_seq, kind, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                job["current_step"],
+                checkpoint_step,
+                job["num_processes"],
+                new_processes,
+                new_round,
+                kind,
+                now,
+            ),
+        )
+        return {
+            "checkpoint_step": checkpoint_step,
+            "num_processes": new_processes,
+            "round_seq": new_round,
+            "next_step": checkpoint_step + 1,
+            "rolled_back_at": now,
+        }
+
     def rollback(
         self,
         job_id: str,
@@ -361,6 +470,7 @@ class Database:
     ) -> dict:
         with self._lock:
             job = self.get_job(job_id)
+            self._ensure_running(job, "手动回退")
             if round_seq != job["round_seq"]:
                 raise ConflictError(
                     f"回退请求来自旧轮次 round={round_seq}，当前轮次为 {job['round_seq']}"
@@ -383,44 +493,188 @@ class Database:
             new_processes = (
                 num_processes if num_processes is not None else job["num_processes"]
             )
-            new_round = job["round_seq"] + 1
-            now = utc_now_iso()
-            # 清空当前轮次的所有确认——旧确认随旧轮次一并作废
-            self._conn.execute(
-                "DELETE FROM confirmations WHERE job_id = ? AND round_seq = ?",
-                (job_id, job["round_seq"]),
-            )
-            # 作废晚于回退目标的检查点：它们位于被放弃的进度上，
-            # 保留会污染回退后的可选检查点列表，并与新一轮登记冲突
-            self._conn.execute(
-                "DELETE FROM checkpoints WHERE job_id = ? AND step > ?",
-                (job_id, checkpoint_step),
-            )
-            self._conn.execute(
-                "UPDATE jobs SET current_step = ?, num_processes = ?,"
-                " round_seq = ?, updated_at = ? WHERE job_id = ?",
-                (checkpoint_step, new_processes, new_round, now, job_id),
-            )
-            self._conn.execute(
-                "INSERT INTO rollback_events"
-                " (job_id, from_step, checkpoint_step, old_processes,"
-                "  new_processes, round_seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    job_id,
-                    job["current_step"],
-                    checkpoint_step,
-                    job["num_processes"],
-                    new_processes,
-                    new_round,
-                    now,
-                ),
-            )
-            self._conn.commit()
-            return {
-                "job_id": job_id,
-                "checkpoint_step": checkpoint_step,
-                "num_processes": new_processes,
-                "round_seq": new_round,
-                "next_step": checkpoint_step + 1,
-                "rolled_back_at": now,
-            }
+            try:
+                info = self._apply_rollback(
+                    job, checkpoint_step, new_processes, "manual"
+                )
+                self._conn.commit()
+            except Exception:
+                # 回退的系列写入要么一起生效，要么整体回滚，不留半提交状态
+                self._conn.rollback()
+                raise
+            return {"job_id": job_id, **info}
+
+    # ------------------------------------------------------------ early stop
+    def _judge_early_stop(self, job_id: str, patience: int) -> dict:
+        """从最早仍可回退的检查点开始按步判定，遇到缺报就等。
+
+        只沿“已登记检查点中损失已连续上报”的最长前缀判定：
+        损失严格刷新最低值则计数清零，否则计数 +1；计数达到 patience 即触发，
+        回退目标为已判定检查点中损失最低者（并列取最早）。
+        判定结果完全由已存上报推导，重启后重算一致。
+        """
+        cks = self._conn.execute(
+            "SELECT step, round_seq FROM checkpoints WHERE job_id = ? ORDER BY step",
+            (job_id,),
+        ).fetchall()
+        reports = {
+            (r["step"], r["round_seq"]): r["loss"]
+            for r in self._conn.execute(
+                "SELECT step, round_seq, loss FROM validation_reports"
+                " WHERE job_id = ?",
+                (job_id,),
+            ).fetchall()
+        }
+        best_loss: Optional[float] = None
+        best_step: Optional[int] = None
+        no_improve = 0
+        judged_through = 0
+        waiting_for: Optional[int] = None
+        triggered = False
+        for ck in cks:
+            loss = reports.get((ck["step"], ck["round_seq"]))
+            if loss is None:
+                waiting_for = ck["step"]  # 缺报就等：更晚的上报先存着，不参与判定
+                break
+            judged_through = ck["step"]
+            if best_loss is None or loss < best_loss:
+                best_loss, best_step = loss, ck["step"]
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    triggered = True
+                    break
+        return {
+            "patience": patience,
+            "judged_through_step": judged_through,
+            "waiting_for_step": waiting_for,
+            "best_loss": best_loss,
+            "best_checkpoint_step": best_step,
+            "no_improve_count": no_improve,
+            "triggered": triggered,
+        }
+
+    def report_loss(
+        self, job_id: str, step: int, checkpoint_round: int, loss: float
+    ) -> dict:
+        """登记某检查点在同一验证集上的损失，并按需触发早停。
+
+        触发早停时，本次上报、自动回退、停训在同一事务提交；
+        事务内任何失败整体回滚，调用方可原样重报。
+        """
+        with self._lock:
+            try:
+                job = self.get_job(job_id)
+                if not math.isfinite(loss):
+                    raise StoreError(f"loss={loss} 不是有限数值，拒收")
+                if job["patience"] is None:
+                    raise ConflictError(
+                        f"作业 {job_id} 创建时未指定 patience，未启用早停，拒收验证损失"
+                    )
+
+                existing = self._conn.execute(
+                    "SELECT loss, reported_at FROM validation_reports"
+                    " WHERE job_id = ? AND step = ? AND round_seq = ?",
+                    (job_id, step, checkpoint_round),
+                ).fetchone()
+                if existing is not None:
+                    if float(existing["loss"]) != float(loss):
+                        raise ConflictError(
+                            f"检查点 step={step}（登记轮次 {checkpoint_round}）已上报损失 "
+                            f"{existing['loss']}，改报不同值 {loss} 被拒绝"
+                        )
+                    # 同值重报：只算一次，不重复判定，直接回当前状态
+                    return {
+                        "job_id": job_id,
+                        "step": step,
+                        "checkpoint_round": checkpoint_round,
+                        "loss": existing["loss"],
+                        "accepted": True,
+                        "newly_recorded": False,
+                        "reported_at": existing["reported_at"],
+                        "job_status": job["status"],
+                        "judgment": self._judge_early_stop(job_id, job["patience"]),
+                        "early_stop": None,
+                    }
+
+                self._ensure_running(job, "新的验证损失上报")
+                # 检查点须仍存在且属于该登记轮次：已作废（被回退删除）检查点的
+                # 迟到结果拒收——即使同步号后来在新轮次重新登记，旧轮次的上报
+                # 依然对不上任何现存检查点。
+                ck = self._conn.execute(
+                    "SELECT 1 FROM checkpoints"
+                    " WHERE job_id = ? AND step = ? AND round_seq = ?",
+                    (job_id, step, checkpoint_round),
+                ).fetchone()
+                if ck is None:
+                    raise ConflictError(
+                        f"没有 step={step}、登记轮次={checkpoint_round} 的现存检查点；"
+                        "该检查点未登记或已作废，迟到结果拒收"
+                    )
+
+                now = utc_now_iso()
+                self._conn.execute(
+                    "INSERT INTO validation_reports"
+                    " (job_id, step, round_seq, loss, reported_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (job_id, step, checkpoint_round, loss, now),
+                )
+                judgment = self._judge_early_stop(job_id, job["patience"])
+                early_stop = None
+                if judgment["triggered"]:
+                    target = judgment["best_checkpoint_step"]
+                    rb = self._apply_rollback(
+                        job, target, job["num_processes"], "early_stop"
+                    )
+                    self._conn.execute(
+                        "UPDATE jobs SET status = 'stopped',"
+                        " stop_checkpoint_step = ?, stopped_at = ?, updated_at = ?"
+                        " WHERE job_id = ?",
+                        (target, now, now, job_id),
+                    )
+                    early_stop = {"status": "stopped", **rb}
+                self._conn.execute(
+                    "UPDATE jobs SET updated_at = ? WHERE job_id = ?", (now, job_id)
+                )
+                self._conn.commit()
+                return {
+                    "job_id": job_id,
+                    "step": step,
+                    "checkpoint_round": checkpoint_round,
+                    "loss": loss,
+                    "accepted": True,
+                    "newly_recorded": True,
+                    "reported_at": now,
+                    "job_status": "stopped" if early_stop else job["status"],
+                    "judgment": judgment,
+                    "early_stop": early_stop,
+                }
+            except Exception:
+                # 触发上报、自动回退、停训必须一起生效；任何失败整体回滚，
+                # 不留半提交状态，调用方修复后可原样重报。
+                self._conn.rollback()
+                raise
+
+    def list_losses(self, job_id: str) -> List[dict]:
+        self.get_job(job_id)
+        rows = self._conn.execute(
+            "SELECT * FROM validation_reports WHERE job_id = ?"
+            " ORDER BY step, round_seq",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def early_stop_status(self, job_id: str) -> dict:
+        job = self.get_job(job_id)
+        base = {
+            "job_id": job_id,
+            "enabled": job["patience"] is not None,
+            "status": job["status"],
+            "patience": job["patience"],
+            "stop_checkpoint_step": job["stop_checkpoint_step"],
+            "stopped_at": job["stopped_at"],
+        }
+        if job["patience"] is None:
+            return base
+        return {**base, **self._judge_early_stop(job_id, job["patience"])}
